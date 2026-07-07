@@ -1,0 +1,9 @@
+spring:
+  application:
+    name: yu-ai-agent
+  ai:
+    dashscope:
+      api-key: ${DASHSCOPE_API_KEY:sk-5470d073c94f45d3aff9b9703f6a8c81}
+      chat:
+        options:
+          model: qwen-plus
