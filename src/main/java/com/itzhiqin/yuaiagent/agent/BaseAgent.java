@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Data
 @Slf4j
@@ -113,6 +114,31 @@ public abstract class BaseAgent {
    public SseEmitter runStream(String userPrompt){
 
       SseEmitter emitter = new SseEmitter(120000L);
+      AtomicBoolean clientDisconnected = new AtomicBoolean(false);
+
+      // 注册回调，在客户端断开、超时、完成时设置标志
+      emitter.onError(throwable -> {
+         clientDisconnected.set(true);
+         this.agentState = AgentState.ERROR;
+         this.cleanup();
+         log.warn("SSE connection error (client may have disconnected): {}", throwable.getMessage());
+      });
+
+      emitter.onTimeout(() -> {
+         clientDisconnected.set(true);
+         this.agentState = AgentState.ERROR;
+         this.cleanup();
+         log.warn("SSE connection timed out");
+      });
+
+      emitter.onCompletion(() -> {
+         clientDisconnected.set(true);
+         if (this.agentState == AgentState.RUNNING) {
+            this.agentState = AgentState.FINISHED;
+         }
+         this.cleanup();
+         log.info("SSE connection completed");
+      });
 
       // 使用线程异步处理，避免阻塞主线程
       CompletableFuture.runAsync(() -> {
@@ -129,14 +155,21 @@ public abstract class BaseAgent {
                return;
             }
          } catch (IOException e) {
-             throw new RuntimeException(e);
+            clientDisconnected.set(true);
+            return;
          }
 
-          this.agentState = AgentState.RUNNING;
+         this.agentState = AgentState.RUNNING;
          memoryList.add(new UserMessage(userPrompt));
 
          try {
             for(int i = 1 ; i <= MAXSTEP && this.agentState!=AgentState.FINISHED; i++){
+
+               // 每次循环前检查客户端是否已断开
+               if (clientDisconnected.get()) {
+                  log.info("Client disconnected, stopping agent loop at step {}", i);
+                  break;
+               }
 
                currentStep = i;
                log.info("execuating step: " + i + "/" + MAXSTEP);
@@ -145,50 +178,47 @@ public abstract class BaseAgent {
                String stepResult = step();
                String result = "step" + i + ": " + stepResult;
 
-               emitter.send(result);
+               // 发送前再次检查，发送时捕获异常
+               if (clientDisconnected.get()) {
+                  log.info("Client disconnected before send at step {}", i);
+                  break;
+               }
+
+               try {
+                  emitter.send(result);
+               } catch (IOException e) {
+                  clientDisconnected.set(true);
+                  log.warn("Failed to send SSE event, client disconnected at step {}", i);
+                  break;
+               }
 
 
             }
             //校验步骤
-            if(currentStep>=MAXSTEP){
-               this.agentState = AgentState.FINISHED;
-               emitter.send("\"MaxStep reached\"");
+            if(!clientDisconnected.get()){
+               if(currentStep>=MAXSTEP){
+                  this.agentState = AgentState.FINISHED;
+                  emitter.send("\"MaxStep reached\"");
+               }
+               //正常完成
+               emitter.complete();
             }
-            //正常完成
-            emitter.complete();
 
          } catch (Exception e) {
             this.agentState = AgentState.ERROR;
             log.error("agent run error",e);
-      //            return "执行错误"+e.getMessage();
-            try {
-               emitter.send("执行错误: " + e.getMessage());
-               emitter.complete();
-            } catch (Exception ex) {
-               emitter.completeWithError(ex);
+            if (!clientDisconnected.get()) {
+               try {
+                  emitter.send("执行错误: " + e.getMessage());
+                  emitter.complete();
+               } catch (IOException ex) {
+                  emitter.completeWithError(ex);
+               }
             }
          }finally {
             this.cleanup();
          }
       });
-
-
-      //超时处理
-      // 设置超时和完成回调
-      emitter.onTimeout(() -> {
-         this.agentState = AgentState.ERROR;
-         this.cleanup();
-         log.warn("SSE connection timed out");
-      });
-
-      emitter.onCompletion(() -> {
-         if (this.agentState == AgentState.RUNNING) {
-            this.agentState = AgentState.FINISHED;
-         }
-         this.cleanup();
-         log.info("SSE connection completed");
-      });
-
 
 
          return emitter;

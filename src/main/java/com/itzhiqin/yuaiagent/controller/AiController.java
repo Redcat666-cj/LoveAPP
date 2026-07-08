@@ -14,6 +14,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import reactor.core.publisher.Flux;
+import reactor.core.Disposable;
 
 import java.io.IOException;
 
@@ -63,16 +64,22 @@ public class AiController {
         // 创建一个超时时间较长的 SseEmitter
         SseEmitter emitter = new SseEmitter(180000L); //三分钟超时
         // 获取 Flux 数据流并直接订阅
-        loveApp.doChatStream(message,chatId).subscribe(
-                chunk->{
+        Disposable subscription = loveApp.doChatStream(message, chatId).subscribe(
+                chunk -> {
                     try {
                         emitter.send(chunk);
                     } catch (IOException e) {
                         emitter.completeWithError(e);
                     }
-                }
+                },
+                emitter::completeWithError,
+                emitter::complete
         );
 
+        // 客户端断开、超时时取消上游 Flux，避免后端继续执行
+        emitter.onError(throwable -> subscription.dispose());
+        emitter.onTimeout(subscription::dispose);
+        emitter.onCompletion(subscription::dispose);
 
         return emitter;
     }
